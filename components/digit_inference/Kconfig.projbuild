@@ -1,0 +1,18 @@
+menu "Digit Inference"
+
+config DIGIT_INFERENCE_TENSOR_ARENA_SIZE
+    int "Tensor arena size (bytes)"
+    range 16384 262144
+    default 98304
+    help
+        Tensor arena used by TensorFlow Lite Micro. Increase this value if
+        AllocateTensors fails at runtime.
+
+config DIGIT_INFERENCE_ARENA_IN_SPIRAM
+    bool "Try PSRAM for tensor arena"
+    default y
+    help
+        If enabled, the inference component first tries to place the tensor
+        arena in PSRAM. It falls back to internal RAM if PSRAM allocation fails.
+
+endmenu
