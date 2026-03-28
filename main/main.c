@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -8,55 +9,9 @@
 #include "freertos/task.h"
 
 #include "digit_inference.h"
+#include "digit_test_images_data.h"
 
 static const char *TAG = "main";
-
-static void generate_demo_pattern(int pattern_id, uint8_t sample[DIGIT_INFERENCE_INPUT_SIZE])
-{
-	memset(sample, 0, DIGIT_INFERENCE_INPUT_SIZE);
-
-	if (pattern_id == 1) {
-		/* Center block */
-		for (int y = 10; y < 18; ++y) {
-			for (int x = 10; x < 18; ++x) {
-				sample[y * DIGIT_INFERENCE_INPUT_SIDE + x] = 255;
-			}
-		}
-		return;
-	}
-
-	if (pattern_id == 2) {
-		/* Ring-like shape */
-		const int cx = 14;
-		const int cy = 14;
-		for (int y = 0; y < DIGIT_INFERENCE_INPUT_SIDE; ++y) {
-			for (int x = 0; x < DIGIT_INFERENCE_INPUT_SIDE; ++x) {
-				const int dx = x - cx;
-				const int dy = y - cy;
-				const int d2 = dx * dx + dy * dy;
-				if (d2 >= 36 && d2 <= 64) {
-					sample[y * DIGIT_INFERENCE_INPUT_SIDE + x] = 255;
-				}
-			}
-		}
-		return;
-	}
-
-	if (pattern_id == 3) {
-		/* Rough "5"-like stroke pattern */
-		for (int x = 6; x <= 21; ++x) {
-			sample[6 * DIGIT_INFERENCE_INPUT_SIDE + x] = 255;
-			sample[14 * DIGIT_INFERENCE_INPUT_SIDE + x] = 255;
-			sample[22 * DIGIT_INFERENCE_INPUT_SIDE + x] = 255;
-		}
-		for (int y = 6; y <= 14; ++y) {
-			sample[y * DIGIT_INFERENCE_INPUT_SIDE + 6] = 255;
-		}
-		for (int y = 14; y <= 22; ++y) {
-			sample[y * DIGIT_INFERENCE_INPUT_SIDE + 21] = 255;
-		}
-	}
-}
 
 static void log_top3(const digit_inference_result_t *result)
 {
@@ -88,10 +43,90 @@ static void log_top3(const digit_inference_result_t *result)
 	}
 }
 
-static void run_digit_inference_smoke_test(void)
+static void log_preprocessed_frame_hex(const char *name, const uint8_t frame[DIGIT_INFERENCE_INPUT_SIZE])
 {
-	uint8_t sample[DIGIT_INFERENCE_INPUT_SIZE] = {0};
+	char row_hex[(DIGIT_INFERENCE_INPUT_SIDE * 2) + 1];
+
+	ESP_LOGI(
+		TAG,
+		"Preproc28 BEGIN name=%s w=%d h=%d format=hex",
+		name,
+		DIGIT_INFERENCE_INPUT_SIDE,
+		DIGIT_INFERENCE_INPUT_SIDE
+	);
+
+	for (int y = 0; y < DIGIT_INFERENCE_INPUT_SIDE; ++y) {
+		for (int x = 0; x < DIGIT_INFERENCE_INPUT_SIDE; ++x) {
+			const uint8_t px = frame[y * DIGIT_INFERENCE_INPUT_SIDE + x];
+			(void)snprintf(&row_hex[x * 2], 3, "%02x", px);
+		}
+		row_hex[DIGIT_INFERENCE_INPUT_SIDE * 2] = '\0';
+		ESP_LOGI(TAG, "Preproc28 ROW%02d %s", y, row_hex);
+	}
+
+	ESP_LOGI(TAG, "Preproc28 END name=%s", name);
+}
+
+static void run_embedded_png_once(size_t image_index, bool dump_preprocessed)
+{
+	const digit_preprocess_params_t *params = digit_preprocess_default_params();
+	uint8_t preprocessed[DIGIT_INFERENCE_INPUT_SIZE] = {0};
 	digit_inference_result_t result = {0};
+	const digit_test_image_t *image = &g_digit_test_images[image_index];
+
+	memset(&result, 0, sizeof(result));
+
+	esp_err_t ret = digit_inference_run_from_gray_u8(
+		image->data,
+		image->width,
+		image->height,
+		params,
+		&result,
+		preprocessed
+	);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "EmbeddedPNG[%u]=%s inference failed: %s", (unsigned)image_index, image->name, esp_err_to_name(ret));
+		return;
+	}
+
+	ESP_LOGI(
+		TAG,
+		"EmbeddedPNG[%u]=%s (%dx%d) -> pred=%d conf=%.3f",
+		(unsigned)image_index,
+		image->name,
+		image->width,
+		image->height,
+		result.predicted_digit,
+		result.confidence
+	);
+	log_top3(&result);
+
+	if (dump_preprocessed) {
+		log_preprocessed_frame_hex(image->name, preprocessed);
+	}
+}
+
+static void png_loop_task(void *arg)
+{
+	uint32_t cycle = 0;
+	(void)arg;
+
+	while (1) {
+		ESP_LOGI(TAG, "PNG loop cycle=%lu count=%u", (unsigned long)cycle, (unsigned)g_digit_test_images_count);
+
+		for (size_t i = 0; i < g_digit_test_images_count; ++i) {
+			const bool dump_preprocessed = (cycle == 0);
+			run_embedded_png_once(i, dump_preprocessed);
+		}
+
+		++cycle;
+		vTaskDelay(pdMS_TO_TICKS(2000));
+	}
+}
+
+void app_main(void)
+{
+	ESP_LOGI(TAG, "Booted. Starting embedded PNG inference loop.");
 
 	esp_err_t ret = digit_inference_init();
 	if (ret != ESP_OK) {
@@ -99,64 +134,5 @@ static void run_digit_inference_smoke_test(void)
 		return;
 	}
 
-	ret = digit_inference_run_u8(sample, &result);
-	if (ret != ESP_OK) {
-		ESP_LOGE(TAG, "digit_inference_run_u8 failed: %s", esp_err_to_name(ret));
-		return;
-	}
-
-	ESP_LOGI(
-		TAG,
-		"Digit inference smoke test -> pred=%d, conf=%.3f",
-		result.predicted_digit,
-		result.confidence
-	);
-	log_top3(&result);
-}
-
-static void demo_task(void *arg)
-{
-	uint32_t tick = 0;
-	uint8_t sample[DIGIT_INFERENCE_INPUT_SIZE];
-	digit_inference_result_t result;
-
-	const char *pattern_names[] = {
-		"blank",
-		"center_block",
-		"ring",
-		"five_like"
-	};
-
-	while (1) {
-		ESP_LOGI(TAG, "Heartbeat tick=%lu", (unsigned long)tick++);
-
-		for (int pattern = 0; pattern < 4; ++pattern) {
-			generate_demo_pattern(pattern, sample);
-			memset(&result, 0, sizeof(result));
-
-			esp_err_t ret = digit_inference_run_u8(sample, &result);
-			if (ret != ESP_OK) {
-				ESP_LOGE(TAG, "Inference failed for %s: %s", pattern_names[pattern], esp_err_to_name(ret));
-				continue;
-			}
-
-			ESP_LOGI(
-				TAG,
-				"Pattern=%s -> pred=%d conf=%.3f",
-				pattern_names[pattern],
-				result.predicted_digit,
-				result.confidence
-			);
-			log_top3(&result);
-		}
-
-		vTaskDelay(pdMS_TO_TICKS(2000));
-	}
-}
-
-void app_main(void)
-{
-	ESP_LOGI(TAG, "Booted. Starting digit inference demo task.");
-	run_digit_inference_smoke_test();
-	xTaskCreate(demo_task, "demo_task", 4096, NULL, 5, NULL);
+	xTaskCreate(png_loop_task, "png_loop_task", 6144, NULL, 5, NULL);
 }

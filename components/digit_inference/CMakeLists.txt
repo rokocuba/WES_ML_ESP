@@ -26,6 +26,24 @@ else()
     set(MODEL_C "${MODEL_GEN_DIR}/mnist_tiny_model_data.c")
     set(MODEL_H "${MODEL_GEN_DIR}/mnist_tiny_model_data.h")
 
+    set(TEST_IMAGE_DIR "${PROJECT_DIR}/models/test_images")
+    set(TEST_IMAGE_INPUTS
+        "${TEST_IMAGE_DIR}/test67_raw.png"
+        "${TEST_IMAGE_DIR}/test6_raw.png"
+    )
+    foreach(TEST_IMAGE ${TEST_IMAGE_INPUTS})
+        if(NOT EXISTS "${TEST_IMAGE}")
+            message(FATAL_ERROR "Missing test image: ${TEST_IMAGE}")
+        endif()
+    endforeach()
+    set(TEST_IMAGE_C "${MODEL_GEN_DIR}/digit_test_images_data.c")
+    set(TEST_IMAGE_H "${MODEL_GEN_DIR}/digit_test_images_data.h")
+
+    set(TEST_IMAGE_ARGS "")
+    foreach(TEST_IMAGE ${TEST_IMAGE_INPUTS})
+        list(APPEND TEST_IMAGE_ARGS --input "${TEST_IMAGE}")
+    endforeach()
+
     # ESP-IDF validates include dirs at configure time, so ensure this exists.
     file(MAKE_DIRECTORY "${MODEL_GEN_DIR}")
 
@@ -45,11 +63,27 @@ else()
 
     add_custom_target(generate_mnist_tiny_model_data DEPENDS "${MODEL_C}" "${MODEL_H}")
 
+    add_custom_command(
+        OUTPUT "${TEST_IMAGE_C}" "${TEST_IMAGE_H}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MODEL_GEN_DIR}"
+        COMMAND "${PYTHON}"
+                "${PROJECT_DIR}/scripts/pngs_to_c_arrays.py"
+                ${TEST_IMAGE_ARGS}
+                --output-c "${TEST_IMAGE_C}"
+                --output-h "${TEST_IMAGE_H}"
+        DEPENDS ${TEST_IMAGE_INPUTS} "${PROJECT_DIR}/scripts/pngs_to_c_arrays.py"
+        COMMENT "Generating embedded test image source"
+        VERBATIM
+    )
+
+    add_custom_target(generate_digit_test_images_data DEPENDS "${TEST_IMAGE_C}" "${TEST_IMAGE_H}")
+
     idf_component_register(
         SRCS
             "digit_inference.cc"
             "digit_preprocess.c"
             "${MODEL_C}"
+            "${TEST_IMAGE_C}"
         INCLUDE_DIRS
             "include"
             "${MODEL_GEN_DIR}"
@@ -57,7 +91,7 @@ else()
             ${DIGIT_INFERENCE_REQUIRES}
     )
 
-    add_dependencies(${COMPONENT_LIB} generate_mnist_tiny_model_data)
+    add_dependencies(${COMPONENT_LIB} generate_mnist_tiny_model_data generate_digit_test_images_data)
 
     target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)
     target_compile_options(${COMPONENT_LIB} PRIVATE -fno-rtti -fno-exceptions)
