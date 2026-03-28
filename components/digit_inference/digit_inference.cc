@@ -4,10 +4,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <new>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "jpeg_decoder.h"
 #include "mnist_tiny_model_data.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -33,6 +35,11 @@ alignas(tflite::MicroInterpreter) uint8_t
     s_interpreter_storage[sizeof(tflite::MicroInterpreter)];
 uint8_t* s_tensor_arena = nullptr;
 size_t s_tensor_arena_size = 0;
+
+uint8_t* s_jpeg_decode_buffer = nullptr;
+size_t s_jpeg_decode_buffer_size = 0;
+uint8_t* s_jpeg_crop_buffer = nullptr;
+size_t s_jpeg_crop_buffer_size = 0;
 
 bool add_resolver_op(TfLiteStatus status, const char* name) {
   if (status == kTfLiteOk) {
@@ -97,6 +104,159 @@ void free_tensor_arena() {
     s_tensor_arena = nullptr;
     s_tensor_arena_size = 0;
   }
+}
+
+void free_jpeg_buffers() {
+  if (s_jpeg_decode_buffer != nullptr) {
+    heap_caps_free(s_jpeg_decode_buffer);
+    s_jpeg_decode_buffer = nullptr;
+    s_jpeg_decode_buffer_size = 0;
+  }
+
+  if (s_jpeg_crop_buffer != nullptr) {
+    heap_caps_free(s_jpeg_crop_buffer);
+    s_jpeg_crop_buffer = nullptr;
+    s_jpeg_crop_buffer_size = 0;
+  }
+}
+
+bool ensure_jpeg_decode_buffer(size_t needed_size) {
+  if (needed_size <= s_jpeg_decode_buffer_size &&
+      s_jpeg_decode_buffer != nullptr) {
+    return true;
+  }
+
+  if (s_jpeg_decode_buffer != nullptr) {
+    heap_caps_free(s_jpeg_decode_buffer);
+    s_jpeg_decode_buffer = nullptr;
+    s_jpeg_decode_buffer_size = 0;
+  }
+
+  s_jpeg_decode_buffer =
+      static_cast<uint8_t*>(heap_caps_malloc(needed_size, MALLOC_CAP_8BIT));
+  if (s_jpeg_decode_buffer == nullptr) {
+    ESP_LOGE(kTag, "Failed to allocate JPEG decode buffer (%u bytes)",
+             static_cast<unsigned>(needed_size));
+    s_jpeg_decode_buffer_size = 0;
+    return false;
+  }
+
+  s_jpeg_decode_buffer_size = needed_size;
+  return true;
+}
+
+bool ensure_jpeg_crop_buffer(size_t needed_size) {
+  if (needed_size <= s_jpeg_crop_buffer_size && s_jpeg_crop_buffer != nullptr) {
+    return true;
+  }
+
+  if (s_jpeg_crop_buffer != nullptr) {
+    heap_caps_free(s_jpeg_crop_buffer);
+    s_jpeg_crop_buffer = nullptr;
+    s_jpeg_crop_buffer_size = 0;
+  }
+
+  s_jpeg_crop_buffer =
+      static_cast<uint8_t*>(heap_caps_malloc(needed_size, MALLOC_CAP_8BIT));
+  if (s_jpeg_crop_buffer == nullptr) {
+    ESP_LOGE(kTag, "Failed to allocate JPEG crop buffer (%u bytes)",
+             static_cast<unsigned>(needed_size));
+    return false;
+  }
+
+  s_jpeg_crop_buffer_size = needed_size;
+  return true;
+}
+
+esp_err_t decode_jpeg_to_gray(const uint8_t* input_jpeg, size_t jpeg_size,
+                              const uint8_t** out_gray, int* out_w,
+                              int* out_h) {
+  if (input_jpeg == nullptr || out_gray == nullptr || out_w == nullptr ||
+      out_h == nullptr || jpeg_size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (jpeg_size > std::numeric_limits<uint32_t>::max()) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_jpeg_image_cfg_t decode_cfg = {};
+  decode_cfg.indata = const_cast<uint8_t*>(input_jpeg);
+  decode_cfg.indata_size = static_cast<uint32_t>(jpeg_size);
+  decode_cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
+  decode_cfg.out_scale = JPEG_IMAGE_SCALE_0;
+  decode_cfg.flags.swap_color_bytes = 0;
+
+  esp_jpeg_image_output_t info = {};
+  esp_err_t err = esp_jpeg_get_image_info(&decode_cfg, &info);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_jpeg_get_image_info failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  const int width = static_cast<int>(info.width);
+  const int height = static_cast<int>(info.height);
+  if (width <= 0 || height <= 0) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  const size_t required_decode_size = info.output_len;
+
+  if (!ensure_jpeg_decode_buffer(required_decode_size)) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  decode_cfg.outbuf = s_jpeg_decode_buffer;
+  decode_cfg.outbuf_size = static_cast<uint32_t>(s_jpeg_decode_buffer_size);
+
+  esp_jpeg_image_output_t outimg = {};
+  err = esp_jpeg_decode(&decode_cfg, &outimg);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_jpeg_decode failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  const size_t pixel_count =
+      static_cast<size_t>(outimg.width) * static_cast<size_t>(outimg.height);
+  const size_t required_rgb565 = pixel_count * 2;
+  if (outimg.output_len < required_rgb565 || outimg.width == 0 ||
+      outimg.height == 0) {
+    ESP_LOGE(kTag, "Unexpected JPEG decode output: len=%u width=%u height=%u",
+             static_cast<unsigned>(outimg.output_len),
+             static_cast<unsigned>(outimg.width),
+             static_cast<unsigned>(outimg.height));
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  const size_t cropped_size = pixel_count;
+  if (!ensure_jpeg_crop_buffer(cropped_size)) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    const uint16_t pixel565 =
+        static_cast<uint16_t>(s_jpeg_decode_buffer[i * 2]) |
+        (static_cast<uint16_t>(s_jpeg_decode_buffer[i * 2 + 1]) << 8);
+    const uint8_t r5 = static_cast<uint8_t>((pixel565 >> 11) & 0x1F);
+    const uint8_t g6 = static_cast<uint8_t>((pixel565 >> 5) & 0x3F);
+    const uint8_t b5 = static_cast<uint8_t>(pixel565 & 0x1F);
+
+    const uint8_t r8 = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+    const uint8_t g8 = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
+    const uint8_t b8 = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+    const uint8_t gray =
+        static_cast<uint8_t>(((77u * static_cast<uint32_t>(r8)) +
+                              (150u * static_cast<uint32_t>(g8)) +
+                              (29u * static_cast<uint32_t>(b8))) >>
+                             8);
+
+    s_jpeg_crop_buffer[i] = gray;
+  }
+
+  *out_gray = s_jpeg_crop_buffer;
+  *out_w = static_cast<int>(outimg.width);
+  *out_h = static_cast<int>(outimg.height);
+  return ESP_OK;
 }
 
 bool allocate_tensor_arena(size_t arena_size) {
@@ -300,6 +460,8 @@ extern "C" void digit_inference_deinit(void) {
   s_input = nullptr;
   s_output = nullptr;
   free_tensor_arena();
+
+  free_jpeg_buffers();
 }
 
 extern "C" esp_err_t digit_inference_run_u8(
@@ -361,4 +523,26 @@ extern "C" esp_err_t digit_inference_run_from_gray_u8(
   }
 
   return digit_inference_run_u8(output_28x28, result);
+}
+
+extern "C" esp_err_t digit_inference_run_from_jpeg_u8(
+    const uint8_t* input_jpeg, size_t jpeg_size,
+    const digit_preprocess_params_t* params, digit_inference_result_t* result,
+    uint8_t output_28x28[DIGIT_INFERENCE_INPUT_SIZE]) {
+  if (input_jpeg == nullptr || jpeg_size == 0 || result == nullptr ||
+      output_28x28 == nullptr) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  const uint8_t* gray = nullptr;
+  int width = 0;
+  int height = 0;
+  esp_err_t err =
+      decode_jpeg_to_gray(input_jpeg, jpeg_size, &gray, &width, &height);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  return digit_inference_run_from_gray_u8(gray, width, height, params, result,
+                                          output_28x28);
 }

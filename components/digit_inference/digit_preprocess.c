@@ -1,50 +1,41 @@
 #include "./digit_inference.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define DIGIT_DIM 28
 #define DIGIT_PIXELS (DIGIT_DIM * DIGIT_DIM)
-#define MASK_REGION_MIN 0.2f
-#define LINK_MASK_MIN 0.12f
+#define INTEGRAL_SIDE (DIGIT_DIM + 1)
 
 typedef struct {
-    float resized[DIGIT_PIXELS];
-    float mask[DIGIT_PIXELS];
-    float stage1[DIGIT_PIXELS];
-    float stage2[DIGIT_PIXELS];
-    float stage3[DIGIT_PIXELS];
-    float darkness[DIGIT_PIXELS];
-    float cloud[DIGIT_PIXELS];
-    float cloud_component[DIGIT_PIXELS];
-    float response[DIGIT_PIXELS];
-    float link_response[DIGIT_PIXELS];
-    float blur_tmp[DIGIT_PIXELS];
-    float sort_scratch[DIGIT_PIXELS];
+    uint8_t resized[DIGIT_PIXELS];
+    uint8_t inverted[DIGIT_PIXELS];
+    uint8_t fitted[DIGIT_PIXELS];
     uint8_t strong[DIGIT_PIXELS];
     uint8_t weak[DIGIT_PIXELS];
     uint8_t linked[DIGIT_PIXELS];
-    uint8_t morph_tmp[DIGIT_PIXELS];
+    uint8_t border_seed[DIGIT_PIXELS];
+    uint8_t border_connected[DIGIT_PIXELS];
+    uint8_t temp_mask[DIGIT_PIXELS];
     int queue[DIGIT_PIXELS];
+    uint32_t integral[INTEGRAL_SIDE * INTEGRAL_SIDE];
 } preprocess_workspace_t;
 
 static preprocess_workspace_t s_ws;
 
 static const digit_preprocess_params_t k_default_params = {
-    .circle_radius = 13.0f,
-    .transition_width = 3.5f,
-    .top_bright_frac = 0.10f,
-    .cloud_sigma = 2.2f,
-    .cloud_strength = 0.95f,
-    .sharpen_radius = 0.9f,
-    .sharpen_amount = 0.22f,
-    .threshold_k = 0.70f,
-    .threshold_floor = 0.03f,
-    .threshold_soft_width = 0.08f,
-    .stroke_link_margin = 0.045f,
+    .process_size = DIGIT_DIM,
+    .window_size = 21,
+    .threshold_t = 0.12f,
+    .relax_delta = 0.10f,
+    .remove_border = true,
+    .target_size = DIGIT_DIM,
+    .box_size = 20,
+    .margin = 1,
+    .fit_foreground_threshold_ratio = 0.01f,
 };
 
 const digit_preprocess_params_t *digit_preprocess_default_params(void)
@@ -57,352 +48,157 @@ static inline int idx_2d(int x, int y)
     return y * DIGIT_DIM + x;
 }
 
-static inline float clampf(float v, float lo, float hi)
+static inline int clampi(int value, int lo, int hi)
 {
-    if (v < lo) {
+    if (value < lo) {
         return lo;
     }
-    if (v > hi) {
+    if (value > hi) {
         return hi;
     }
-    return v;
+    return value;
 }
 
-static int compare_float_asc(const void *a, const void *b)
+static inline float clampf(float value, float lo, float hi)
 {
-    const float fa = *(const float *)a;
-    const float fb = *(const float *)b;
-    if (fa < fb) {
-        return -1;
+    if (value < lo) {
+        return lo;
     }
-    if (fa > fb) {
-        return 1;
+    if (value > hi) {
+        return hi;
     }
-    return 0;
+    return value;
 }
 
-static float percentile_from_sorted(const float *sorted, int count, float percentile)
-{
-    if (count <= 0) {
-        return 0.0f;
-    }
-
-    const float p = clampf(percentile, 0.0f, 100.0f) * 0.01f;
-    const float idx = p * (float)(count - 1);
-    const int lo = (int)floorf(idx);
-    const int hi = (int)ceilf(idx);
-    if (lo == hi) {
-        return sorted[lo];
-    }
-
-    const float alpha = idx - (float)lo;
-    return sorted[lo] * (1.0f - alpha) + sorted[hi] * alpha;
-}
-
-static int collect_masked_values(
-    const float *values,
-    const float *mask,
-    float mask_min,
-    float *out
+static void resize_bilinear_u8(
+    const uint8_t *src,
+    int src_w,
+    int src_h,
+    uint8_t *dst,
+    int dst_w,
+    int dst_h
 )
 {
-    int count = 0;
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        if (mask[i] >= mask_min) {
-            out[count++] = values[i];
-        }
-    }
-    return count;
-}
-
-static float top_bright_mean(const float *image, float fraction, float *scratch)
-{
-    const float frac = clampf(fraction, 0.001f, 1.0f);
-    const int top_n = (int)lroundf(frac * (float)DIGIT_PIXELS);
-    const int n = top_n < 1 ? 1 : (top_n > DIGIT_PIXELS ? DIGIT_PIXELS : top_n);
-
-    memcpy(scratch, image, sizeof(float) * DIGIT_PIXELS);
-    qsort(scratch, DIGIT_PIXELS, sizeof(float), compare_float_asc);
-
-    float sum = 0.0f;
-    for (int i = DIGIT_PIXELS - n; i < DIGIT_PIXELS; ++i) {
-        sum += scratch[i];
-    }
-    return sum / (float)n;
-}
-
-static float percentile_masked(
-    const float *values,
-    const float *mask,
-    float mask_min,
-    float percentile,
-    float *scratch
-)
-{
-    int count = collect_masked_values(values, mask, mask_min, scratch);
-    if (count <= 0) {
-        memcpy(scratch, values, sizeof(float) * DIGIT_PIXELS);
-        count = DIGIT_PIXELS;
-    }
-
-    qsort(scratch, count, sizeof(float), compare_float_asc);
-    return percentile_from_sorted(scratch, count, percentile);
-}
-
-static void mean_std_masked(
-    const float *values,
-    const float *mask,
-    float mask_min,
-    float *mean_out,
-    float *std_out,
-    float *scratch
-)
-{
-    int count = collect_masked_values(values, mask, mask_min, scratch);
-    if (count <= 0) {
-        memcpy(scratch, values, sizeof(float) * DIGIT_PIXELS);
-        count = DIGIT_PIXELS;
-    }
-
-    float sum = 0.0f;
-    for (int i = 0; i < count; ++i) {
-        sum += scratch[i];
-    }
-    const float mean = sum / (float)count;
-
-    float var = 0.0f;
-    for (int i = 0; i < count; ++i) {
-        const float d = scratch[i] - mean;
-        var += d * d;
-    }
-    var /= (float)count;
-
-    *mean_out = mean;
-    *std_out = sqrtf(var);
-}
-
-static float otsu_threshold(const float *values, int count)
-{
-    if (count <= 0) {
-        return 0.5f;
-    }
-
-    uint32_t hist[256];
-    memset(hist, 0, sizeof(hist));
-
-    for (int i = 0; i < count; ++i) {
-        int q = (int)lroundf(clampf(values[i], 0.0f, 1.0f) * 255.0f);
-        if (q < 0) {
-            q = 0;
-        }
-        if (q > 255) {
-            q = 255;
-        }
-        hist[q]++;
-    }
-
-    const float total = (float)count;
-    float sum_total = 0.0f;
-    for (int i = 0; i < 256; ++i) {
-        sum_total += (float)i * (float)hist[i];
-    }
-
-    float sum_bg = 0.0f;
-    float weight_bg = 0.0f;
-    float max_between = -1.0f;
-    int threshold = 127;
-
-    for (int i = 0; i < 256; ++i) {
-        weight_bg += (float)hist[i];
-        if (weight_bg <= 0.0f) {
-            continue;
-        }
-
-        const float weight_fg = total - weight_bg;
-        if (weight_fg <= 0.0f) {
-            break;
-        }
-
-        sum_bg += (float)i * (float)hist[i];
-        const float mean_bg = sum_bg / weight_bg;
-        const float mean_fg = (sum_total - sum_bg) / weight_fg;
-        const float diff = mean_bg - mean_fg;
-        const float between = weight_bg * weight_fg * diff * diff;
-        if (between > max_between) {
-            max_between = between;
-            threshold = i;
-        }
-    }
-
-    return (float)threshold / 255.0f;
-}
-
-static void resize_bilinear_to_28(const uint8_t *src, int src_w, int src_h, float *dst)
-{
-    for (int y = 0; y < DIGIT_DIM; ++y) {
-        const float gy = ((float)y + 0.5f) * (float)src_h / (float)DIGIT_DIM - 0.5f;
+    for (int y = 0; y < dst_h; ++y) {
+        const float gy = ((float)y + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
         int y0 = (int)floorf(gy);
         int y1 = y0 + 1;
         const float wy = gy - (float)y0;
 
-        if (y0 < 0) {
-            y0 = 0;
-        }
-        if (y1 >= src_h) {
-            y1 = src_h - 1;
-        }
+        y0 = clampi(y0, 0, src_h - 1);
+        y1 = clampi(y1, 0, src_h - 1);
 
-        for (int x = 0; x < DIGIT_DIM; ++x) {
-            const float gx = ((float)x + 0.5f) * (float)src_w / (float)DIGIT_DIM - 0.5f;
+        for (int x = 0; x < dst_w; ++x) {
+            const float gx = ((float)x + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
             int x0 = (int)floorf(gx);
             int x1 = x0 + 1;
             const float wx = gx - (float)x0;
 
-            if (x0 < 0) {
-                x0 = 0;
-            }
-            if (x1 >= src_w) {
-                x1 = src_w - 1;
-            }
+            x0 = clampi(x0, 0, src_w - 1);
+            x1 = clampi(x1, 0, src_w - 1);
 
-            const float p00 = (float)src[y0 * src_w + x0] / 255.0f;
-            const float p01 = (float)src[y0 * src_w + x1] / 255.0f;
-            const float p10 = (float)src[y1 * src_w + x0] / 255.0f;
-            const float p11 = (float)src[y1 * src_w + x1] / 255.0f;
+            const float p00 = (float)src[y0 * src_w + x0];
+            const float p01 = (float)src[y0 * src_w + x1];
+            const float p10 = (float)src[y1 * src_w + x0];
+            const float p11 = (float)src[y1 * src_w + x1];
 
             const float top = p00 + (p01 - p00) * wx;
             const float bottom = p10 + (p11 - p10) * wx;
-            dst[idx_2d(x, y)] = clampf(top + (bottom - top) * wy, 0.0f, 1.0f);
+            const int out = (int)lroundf(top + (bottom - top) * wy);
+            dst[y * dst_w + x] = (uint8_t)clampi(out, 0, 255);
         }
     }
 }
 
-static void build_soft_circle_mask(float radius, float transition_width, float *mask)
+static void build_integral_u8(const uint8_t *gray, uint32_t *integral)
 {
-    const float outer = radius > 1.0f ? radius : 1.0f;
-    const float tw = transition_width > 0.1f ? transition_width : 0.1f;
-    const float softness = clampf(tw / outer, 0.05f, 1.0f);
-    const float gamma = 1.15f - 0.60f * softness;
-
-    const float cx = ((float)DIGIT_DIM - 1.0f) * 0.5f;
-    const float cy = ((float)DIGIT_DIM - 1.0f) * 0.5f;
+    memset(integral, 0, sizeof(uint32_t) * INTEGRAL_SIDE * INTEGRAL_SIDE);
 
     for (int y = 0; y < DIGIT_DIM; ++y) {
+        uint32_t row_sum = 0;
         for (int x = 0; x < DIGIT_DIM; ++x) {
-            const float dx = (float)x - cx;
-            const float dy = (float)y - cy;
-            const float dist = sqrtf(dx * dx + dy * dy);
-
-            const float radial = clampf(1.0f - dist / outer, 0.0f, 1.0f);
-            const float smooth = radial * radial * (3.0f - 2.0f * radial);
-            mask[idx_2d(x, y)] = powf(clampf(smooth, 0.0f, 1.0f), gamma);
+            row_sum += (uint32_t)gray[idx_2d(x, y)];
+            integral[(y + 1) * INTEGRAL_SIDE + (x + 1)] =
+                integral[y * INTEGRAL_SIDE + (x + 1)] + row_sum;
         }
     }
 }
 
-static int make_gaussian_kernel(float sigma, float *kernel, int kernel_cap)
+static void bradley_roth_mask_28(
+    const uint8_t *gray,
+    int window_size,
+    float t_value,
+    uint8_t *mask,
+    uint32_t *integral
+)
 {
-    const float sig = sigma > 0.3f ? sigma : 0.3f;
-    int radius = (int)ceilf(3.0f * sig);
-    if (radius < 1) {
-        radius = 1;
-    }
-    if (radius > 6) {
-        radius = 6;
-    }
+    build_integral_u8(gray, integral);
 
-    int len = radius * 2 + 1;
-    if (len > kernel_cap) {
-        len = kernel_cap;
-        radius = len / 2;
+    int local_window = window_size;
+    if (local_window < 3) {
+        local_window = 3;
+    }
+    if ((local_window % 2) == 0) {
+        local_window += 1;
     }
 
-    float sum = 0.0f;
-    for (int i = -radius; i <= radius; ++i) {
-        const float v = expf(-(float)(i * i) / (2.0f * sig * sig));
-        kernel[i + radius] = v;
-        sum += v;
-    }
-
-    if (sum <= 1e-9f) {
-        sum = 1.0f;
-    }
-
-    for (int i = 0; i < len; ++i) {
-        kernel[i] /= sum;
-    }
-
-    return len;
-}
-
-static void gaussian_blur_28(const float *src, float *dst, float sigma, float *tmp)
-{
-    if (sigma <= 0.0f) {
-        memcpy(dst, src, sizeof(float) * DIGIT_PIXELS);
-        return;
-    }
-
-    float kernel[13];
-    const int len = make_gaussian_kernel(sigma, kernel, 13);
-    const int radius = len / 2;
+    const int radius = local_window / 2;
+    const float t = clampf(t_value, 0.0f, 0.99f);
 
     for (int y = 0; y < DIGIT_DIM; ++y) {
-        for (int x = 0; x < DIGIT_DIM; ++x) {
-            float acc = 0.0f;
-            for (int k = -radius; k <= radius; ++k) {
-                int sx = x + k;
-                if (sx < 0) {
-                    sx = 0;
-                }
-                if (sx >= DIGIT_DIM) {
-                    sx = DIGIT_DIM - 1;
-                }
-                acc += src[idx_2d(sx, y)] * kernel[k + radius];
-            }
-            tmp[idx_2d(x, y)] = acc;
-        }
-    }
+        const int y0 = clampi(y - radius, 0, DIGIT_DIM - 1);
+        const int y1 = clampi(y + radius, 0, DIGIT_DIM - 1);
 
-    for (int y = 0; y < DIGIT_DIM; ++y) {
         for (int x = 0; x < DIGIT_DIM; ++x) {
-            float acc = 0.0f;
-            for (int k = -radius; k <= radius; ++k) {
-                int sy = y + k;
-                if (sy < 0) {
-                    sy = 0;
-                }
-                if (sy >= DIGIT_DIM) {
-                    sy = DIGIT_DIM - 1;
-                }
-                acc += tmp[idx_2d(x, sy)] * kernel[k + radius];
-            }
-            dst[idx_2d(x, y)] = acc;
+            const int x0 = clampi(x - radius, 0, DIGIT_DIM - 1);
+            const int x1 = clampi(x + radius, 0, DIGIT_DIM - 1);
+
+            const int i_y0 = y0;
+            const int i_y1 = y1 + 1;
+            const int i_x0 = x0;
+            const int i_x1 = x1 + 1;
+
+            const uint32_t local_sum =
+                integral[i_y1 * INTEGRAL_SIDE + i_x1]
+                - integral[i_y0 * INTEGRAL_SIDE + i_x1]
+                - integral[i_y1 * INTEGRAL_SIDE + i_x0]
+                + integral[i_y0 * INTEGRAL_SIDE + i_x0];
+
+            const int area = (y1 - y0 + 1) * (x1 - x0 + 1);
+            const float lhs = (float)gray[idx_2d(x, y)] * (float)area;
+            const float rhs = (float)local_sum * (1.0f - t);
+            mask[idx_2d(x, y)] = (lhs <= rhs) ? 1 : 0;
         }
     }
 }
 
-static void binary_propagate(
-    const uint8_t *strong,
-    const uint8_t *weak,
-    uint8_t *linked,
+static bool mask_has_foreground(const uint8_t *mask)
+{
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        if (mask[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void flood_fill_from_seed(
+    const uint8_t *seed,
+    const uint8_t *allowed,
+    uint8_t *out,
     int *queue
 )
 {
-    memset(linked, 0, DIGIT_PIXELS);
+    memset(out, 0, DIGIT_PIXELS);
 
     int head = 0;
     int tail = 0;
 
     for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        if (strong[i]) {
-            linked[i] = 1;
+        if (seed[i] && allowed[i]) {
+            out[i] = 1;
             queue[tail++] = i;
         }
-    }
-
-    if (tail == 0) {
-        memcpy(linked, weak, DIGIT_PIXELS);
-        return;
     }
 
     while (head < tail) {
@@ -421,8 +217,8 @@ static void binary_propagate(
                     continue;
                 }
                 const int nidx = idx_2d(nx, ny);
-                if (!linked[nidx] && weak[nidx]) {
-                    linked[nidx] = 1;
+                if (allowed[nidx] && !out[nidx]) {
+                    out[nidx] = 1;
                     queue[tail++] = nidx;
                 }
             }
@@ -430,57 +226,135 @@ static void binary_propagate(
     }
 }
 
-static void binary_dilate3x3(const uint8_t *src, uint8_t *dst)
+static void remove_border_connected_inplace(
+    uint8_t *mask,
+    uint8_t *border_seed,
+    uint8_t *border_connected,
+    int *queue
+)
 {
+    memset(border_seed, 0, DIGIT_PIXELS);
+
+    for (int x = 0; x < DIGIT_DIM; ++x) {
+        border_seed[idx_2d(x, 0)] = mask[idx_2d(x, 0)];
+        border_seed[idx_2d(x, DIGIT_DIM - 1)] = mask[idx_2d(x, DIGIT_DIM - 1)];
+    }
+
     for (int y = 0; y < DIGIT_DIM; ++y) {
-        for (int x = 0; x < DIGIT_DIM; ++x) {
-            uint8_t value = 0;
-            for (int dy = -1; dy <= 1 && !value; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int nx = x + dx;
-                    const int ny = y + dy;
-                    if (nx < 0 || nx >= DIGIT_DIM || ny < 0 || ny >= DIGIT_DIM) {
-                        continue;
-                    }
-                    if (src[idx_2d(nx, ny)]) {
-                        value = 1;
-                        break;
-                    }
-                }
-            }
-            dst[idx_2d(x, y)] = value;
+        border_seed[idx_2d(0, y)] |= mask[idx_2d(0, y)];
+        border_seed[idx_2d(DIGIT_DIM - 1, y)] |= mask[idx_2d(DIGIT_DIM - 1, y)];
+    }
+
+    flood_fill_from_seed(border_seed, mask, border_connected, queue);
+
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        if (border_connected[i]) {
+            mask[i] = 0;
         }
     }
 }
 
-static void binary_erode3x3(const uint8_t *src, uint8_t *dst)
+static void fit_digit_to_canvas_28(
+    const uint8_t *input,
+    int box_size,
+    int margin,
+    float foreground_threshold_ratio,
+    uint8_t *output
+)
 {
+    uint8_t crop[DIGIT_PIXELS];
+    uint8_t resized[DIGIT_PIXELS];
+
+    const int threshold =
+        clampi((int)lroundf(clampf(foreground_threshold_ratio, 0.0f, 1.0f) * 255.0f), 0, 255);
+
+    int min_x = DIGIT_DIM;
+    int min_y = DIGIT_DIM;
+    int max_x = -1;
+    int max_y = -1;
+
     for (int y = 0; y < DIGIT_DIM; ++y) {
         for (int x = 0; x < DIGIT_DIM; ++x) {
-            uint8_t value = 1;
-            for (int dy = -1; dy <= 1 && value; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int nx = x + dx;
-                    const int ny = y + dy;
-                    if (nx < 0 || nx >= DIGIT_DIM || ny < 0 || ny >= DIGIT_DIM) {
-                        value = 0;
-                        break;
-                    }
-                    if (!src[idx_2d(nx, ny)]) {
-                        value = 0;
-                        break;
-                    }
+            if (input[idx_2d(x, y)] > threshold) {
+                if (x < min_x) {
+                    min_x = x;
+                }
+                if (x > max_x) {
+                    max_x = x;
+                }
+                if (y < min_y) {
+                    min_y = y;
+                }
+                if (y > max_y) {
+                    max_y = y;
                 }
             }
-            dst[idx_2d(x, y)] = value;
         }
     }
-}
 
-static void binary_closing3x3(uint8_t *image, uint8_t *tmp)
-{
-    binary_dilate3x3(image, tmp);
-    binary_erode3x3(tmp, image);
+    if (max_x < min_x || max_y < min_y) {
+        memcpy(output, input, DIGIT_PIXELS);
+        return;
+    }
+
+    const int crop_w = max_x - min_x + 1;
+    const int crop_h = max_y - min_y + 1;
+
+    for (int y = 0; y < crop_h; ++y) {
+        for (int x = 0; x < crop_w; ++x) {
+            crop[y * crop_w + x] = input[idx_2d(min_x + x, min_y + y)];
+        }
+    }
+
+    int local_margin = margin;
+    if (local_margin < 0) {
+        local_margin = 0;
+    }
+    if (local_margin >= (DIGIT_DIM / 2)) {
+        local_margin = (DIGIT_DIM / 2) - 1;
+    }
+
+    int max_box = DIGIT_DIM - (2 * local_margin);
+    if (max_box < 1) {
+        max_box = 1;
+    }
+
+    const int target_long = clampi(box_size, 1, max_box);
+    const int long_side = (crop_h > crop_w) ? crop_h : crop_w;
+    const float scale = (float)target_long / (float)((long_side > 0) ? long_side : 1);
+
+    const int new_h = clampi((int)lroundf((float)crop_h * scale), 1, DIGIT_DIM);
+    const int new_w = clampi((int)lroundf((float)crop_w * scale), 1, DIGIT_DIM);
+
+    resize_bilinear_u8(crop, crop_w, crop_h, resized, new_w, new_h);
+
+    memset(output, 0, DIGIT_PIXELS);
+
+    const int center_y = (DIGIT_DIM - new_h) / 2;
+    const int center_x = (DIGIT_DIM - new_w) / 2;
+
+    int y_min = local_margin;
+    int x_min = local_margin;
+    int y_max = DIGIT_DIM - new_h - local_margin;
+    int x_max = DIGIT_DIM - new_w - local_margin;
+
+    if (y_max < y_min) {
+        y_min = 0;
+        y_max = DIGIT_DIM - new_h;
+    }
+    if (x_max < x_min) {
+        x_min = 0;
+        x_max = DIGIT_DIM - new_w;
+    }
+
+    const int y_start = clampi(center_y, y_min, y_max);
+    const int x_start = clampi(center_x, x_min, x_max);
+
+    for (int y = 0; y < new_h; ++y) {
+        for (int x = 0; x < new_w; ++x) {
+            output[idx_2d(x_start + x, y_start + y)] = resized[y * new_w + x];
+        }
+    }
 }
 
 esp_err_t digit_preprocess_u8(
@@ -500,169 +374,67 @@ esp_err_t digit_preprocess_u8(
         p = digit_preprocess_default_params();
     }
 
-    resize_bilinear_to_28(input_gray, width, height, s_ws.resized);
+    if (p->process_size != DIGIT_DIM || p->target_size != DIGIT_DIM) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
-    const float max_radius = ((float)DIGIT_DIM - 1.0f) * 0.5f;
-    const float radius = clampf(p->circle_radius, 1.0f, max_radius);
-    const float transition = clampf(p->transition_width, 0.5f, radius - 0.5f);
+    int window_size = p->window_size;
+    if (window_size < 3) {
+        window_size = 3;
+    }
+    if ((window_size % 2) == 0) {
+        window_size += 1;
+    }
 
-    build_soft_circle_mask(radius, transition, s_ws.mask);
+    resize_bilinear_u8(input_gray, width, height, s_ws.resized, DIGIT_DIM, DIGIT_DIM);
 
-    const float bright_ref = top_bright_mean(
+    bradley_roth_mask_28(
         s_ws.resized,
-        p->top_bright_frac,
-        s_ws.sort_scratch
+        window_size,
+        p->threshold_t,
+        s_ws.strong,
+        s_ws.integral
     );
 
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        s_ws.stage1[i] = clampf(
-            s_ws.mask[i] * s_ws.resized[i] + (1.0f - s_ws.mask[i]) * bright_ref,
-            0.0f,
-            1.0f
+    bradley_roth_mask_28(
+        s_ws.resized,
+        window_size,
+        p->threshold_t - p->relax_delta,
+        s_ws.weak,
+        s_ws.integral
+    );
+
+    flood_fill_from_seed(s_ws.strong, s_ws.weak, s_ws.linked, s_ws.queue);
+    if (!mask_has_foreground(s_ws.linked)) {
+        memcpy(s_ws.linked, s_ws.strong, DIGIT_PIXELS);
+    }
+
+    if (p->remove_border) {
+        memcpy(s_ws.temp_mask, s_ws.linked, DIGIT_PIXELS);
+        remove_border_connected_inplace(
+            s_ws.temp_mask,
+            s_ws.border_seed,
+            s_ws.border_connected,
+            s_ws.queue
         );
-    }
-
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        s_ws.darkness[i] = clampf(bright_ref - s_ws.stage1[i], 0.0f, 1.0f);
-    }
-
-    gaussian_blur_28(
-        s_ws.darkness,
-        s_ws.cloud,
-        p->cloud_sigma,
-        s_ws.blur_tmp
-    );
-
-    const float cloud_floor = percentile_masked(
-        s_ws.cloud,
-        s_ws.mask,
-        MASK_REGION_MIN,
-        35.0f,
-        s_ws.sort_scratch
-    );
-
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        s_ws.cloud_component[i] = clampf(s_ws.cloud[i] - cloud_floor, 0.0f, 1.0f);
-    }
-
-    float dark_p90 = percentile_masked(
-        s_ws.darkness,
-        s_ws.mask,
-        MASK_REGION_MIN,
-        90.0f,
-        s_ws.sort_scratch
-    );
-    if (dark_p90 < 1e-6f) {
-        dark_p90 = 1e-6f;
-    }
-
-    const float cloud_strength = p->cloud_strength < 0.0f ? 0.0f : p->cloud_strength;
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        const float protect = 1.0f - clampf(s_ws.darkness[i] / dark_p90, 0.0f, 1.0f);
-        const float effective = cloud_strength * protect * s_ws.mask[i];
-        const float corrected_darkness = clampf(
-            s_ws.darkness[i] - effective * s_ws.cloud_component[i],
-            0.0f,
-            1.0f
-        );
-        s_ws.stage2[i] = clampf(bright_ref - corrected_darkness, 0.0f, 1.0f);
-    }
-
-    gaussian_blur_28(
-        s_ws.stage2,
-        s_ws.blur_tmp,
-        p->sharpen_radius,
-        s_ws.cloud_component
-    );
-
-    const float sharpen_amount = p->sharpen_amount < 0.0f ? 0.0f : p->sharpen_amount;
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        const float sharp = clampf(
-            s_ws.stage2[i] + sharpen_amount * (s_ws.stage2[i] - s_ws.blur_tmp[i]),
-            0.0f,
-            1.0f
-        );
-        s_ws.stage3[i] = clampf(
-            s_ws.stage2[i] * (1.0f - s_ws.mask[i]) + sharp * s_ws.mask[i],
-            0.0f,
-            1.0f
-        );
-    }
-
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        s_ws.darkness[i] = clampf(1.0f - s_ws.stage3[i], 0.0f, 1.0f);
-    }
-
-    int region_count = collect_masked_values(
-        s_ws.darkness,
-        s_ws.mask,
-        MASK_REGION_MIN,
-        s_ws.sort_scratch
-    );
-    if (region_count <= 0) {
-        memcpy(s_ws.sort_scratch, s_ws.darkness, sizeof(float) * DIGIT_PIXELS);
-        region_count = DIGIT_PIXELS;
-    }
-
-    const float otsu_t = otsu_threshold(s_ws.sort_scratch, region_count);
-
-    float dark_mean = 0.0f;
-    float dark_std = 0.0f;
-    mean_std_masked(
-        s_ws.darkness,
-        s_ws.mask,
-        MASK_REGION_MIN,
-        &dark_mean,
-        &dark_std,
-        s_ws.sort_scratch
-    );
-
-    const float gauss_t = clampf(dark_mean + p->threshold_k * dark_std, 0.0f, 1.0f);
-    float threshold = otsu_t < gauss_t ? otsu_t : gauss_t;
-    threshold = clampf(threshold, p->threshold_floor, 0.98f);
-    const float soft_w = clampf(p->threshold_soft_width, 0.01f, 0.50f);
-
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        float response = (s_ws.darkness[i] - threshold) / soft_w;
-        response = clampf(response, 0.0f, 1.0f);
-        response *= s_ws.mask[i];
-        s_ws.response[i] = clampf(response, 0.0f, 1.0f);
-    }
-
-    const float link_margin = clampf(p->stroke_link_margin, 0.0f, 0.15f);
-    const float link_low = clampf(threshold - link_margin, p->threshold_floor, threshold);
-
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        const uint8_t in_link_mask = (s_ws.mask[i] >= LINK_MASK_MIN) ? 1 : 0;
-        s_ws.strong[i] = (s_ws.darkness[i] >= threshold && in_link_mask) ? 1 : 0;
-        s_ws.weak[i] = (s_ws.darkness[i] >= link_low && in_link_mask) ? 1 : 0;
-    }
-
-    binary_propagate(s_ws.strong, s_ws.weak, s_ws.linked, s_ws.queue);
-    binary_closing3x3(s_ws.linked, s_ws.morph_tmp);
-
-    const float link_den = (threshold - link_low) + 1e-6f;
-    for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        float link_response = (s_ws.darkness[i] - link_low) / link_den;
-        link_response = clampf(link_response, 0.0f, 1.0f);
-        s_ws.link_response[i] = link_response;
-
-        if (s_ws.linked[i]) {
-            const float recovered = 0.70f * link_response;
-            if (recovered > s_ws.response[i]) {
-                s_ws.response[i] = recovered;
-            }
-        } else {
-            s_ws.response[i] = 0.0f;
+        if (mask_has_foreground(s_ws.temp_mask)) {
+            memcpy(s_ws.linked, s_ws.temp_mask, DIGIT_PIXELS);
         }
-
-        s_ws.response[i] = clampf(s_ws.response[i] * s_ws.mask[i], 0.0f, 1.0f);
     }
 
-    /* Final stage-4 output is inverted polarity: white digit on black background. */
     for (int i = 0; i < DIGIT_PIXELS; ++i) {
-        output_28x28[i] = (uint8_t)lroundf(clampf(s_ws.response[i], 0.0f, 1.0f) * 255.0f);
+        const uint8_t foreground_gray = s_ws.linked[i] ? s_ws.resized[i] : 255;
+        s_ws.inverted[i] = (uint8_t)(255 - foreground_gray);
     }
 
+    fit_digit_to_canvas_28(
+        s_ws.inverted,
+        p->box_size,
+        p->margin,
+        p->fit_foreground_threshold_ratio,
+        s_ws.fitted
+    );
+
+    memcpy(output_28x28, s_ws.fitted, DIGIT_PIXELS);
     return ESP_OK;
 }

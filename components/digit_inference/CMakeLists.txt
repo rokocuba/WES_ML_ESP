@@ -1,6 +1,7 @@
 set(DIGIT_INFERENCE_REQUIRES
     esp-tflite-micro
     esp_timer
+    esp_jpeg
 )
 
 if(CMAKE_SCRIPT_MODE_FILE)
@@ -27,15 +28,15 @@ else()
     set(MODEL_H "${MODEL_GEN_DIR}/mnist_tiny_model_data.h")
 
     set(TEST_IMAGE_DIR "${PROJECT_DIR}/models/test_images")
-    set(TEST_IMAGE_INPUTS
-        "${TEST_IMAGE_DIR}/test67_raw.png"
-        "${TEST_IMAGE_DIR}/test6_raw.png"
+    file(GLOB TEST_IMAGE_INPUTS
+        "${TEST_IMAGE_DIR}/*.png"
+        "${TEST_IMAGE_DIR}/*.jpg"
+        "${TEST_IMAGE_DIR}/*.jpeg"
     )
-    foreach(TEST_IMAGE ${TEST_IMAGE_INPUTS})
-        if(NOT EXISTS "${TEST_IMAGE}")
-            message(FATAL_ERROR "Missing test image: ${TEST_IMAGE}")
-        endif()
-    endforeach()
+    list(SORT TEST_IMAGE_INPUTS)
+    if(TEST_IMAGE_INPUTS STREQUAL "")
+        message(FATAL_ERROR "No test images found in ${TEST_IMAGE_DIR} (expected .png/.jpg/.jpeg)")
+    endif()
     set(TEST_IMAGE_C "${MODEL_GEN_DIR}/digit_test_images_data.c")
     set(TEST_IMAGE_H "${MODEL_GEN_DIR}/digit_test_images_data.h")
 

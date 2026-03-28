@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert one or more PNG files into grayscale byte arrays for ESP-IDF builds."""
+"""Convert one or more image files into grayscale byte arrays for ESP-IDF builds."""
 
 from __future__ import annotations
 
@@ -22,14 +22,14 @@ class ImageRecord:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert PNG files into C source/header with grayscale byte arrays."
+        description="Convert image files into C source/header with grayscale byte arrays."
     )
     parser.add_argument(
         "--input",
         type=Path,
         action="append",
         required=True,
-        help="Input PNG path. Can be provided multiple times.",
+        help="Input image path (.png/.jpg/.jpeg). Can be provided multiple times.",
     )
     parser.add_argument("--output-c", type=Path, required=True, help="Output .c file")
     parser.add_argument("--output-h", type=Path, required=True, help="Output .h file")
