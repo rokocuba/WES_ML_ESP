@@ -15,4 +15,12 @@ config DIGIT_INFERENCE_ARENA_IN_SPIRAM
         If enabled, the inference component first tries to place the tensor
         arena in PSRAM. It falls back to internal RAM if PSRAM allocation fails.
 
+config DIGIT_INFERENCE_PERF_LOGS
+    bool "Enable preprocessing/inference performance logs"
+    default y
+    help
+        If enabled, the component logs decode, preprocess, and inference timing
+        plus heap snapshots (internal, PSRAM, and total 8-bit) for capacity
+        planning when sharing resources with camera pipelines.
+
 endmenu

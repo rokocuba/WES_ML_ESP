@@ -9,6 +9,9 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "jpeg_decoder.h"
 #include "mnist_tiny_model_data.h"
 #include "tensorflow/lite/c/common.h"
@@ -40,6 +43,102 @@ uint8_t* s_jpeg_decode_buffer = nullptr;
 size_t s_jpeg_decode_buffer_size = 0;
 uint8_t* s_jpeg_crop_buffer = nullptr;
 size_t s_jpeg_crop_buffer_size = 0;
+
+struct perf_snapshot_t {
+  size_t free_8bit;
+  size_t largest_8bit;
+  size_t minimum_8bit;
+  size_t free_internal;
+  size_t largest_internal;
+  size_t minimum_internal;
+  size_t free_spiram;
+  size_t largest_spiram;
+  size_t minimum_spiram;
+  UBaseType_t stack_hwm_words;
+};
+
+void capture_perf_snapshot(perf_snapshot_t* snap) {
+  if (snap == nullptr) {
+    return;
+  }
+
+  snap->free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  snap->largest_8bit = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  snap->minimum_8bit = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+
+  snap->free_internal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  snap->largest_internal =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  snap->minimum_internal =
+      heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+  snap->free_spiram =
+      heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  snap->largest_spiram =
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  snap->minimum_spiram =
+      heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  snap->stack_hwm_words = uxTaskGetStackHighWaterMark(nullptr);
+}
+
+void log_pipeline_perf(const char* path_name, size_t input_bytes,
+                       int input_width, int input_height, int64_t decode_us,
+                       int64_t preprocess_us, int64_t inference_us,
+                       const perf_snapshot_t& before,
+                       const perf_snapshot_t& after) {
+#if CONFIG_DIGIT_INFERENCE_PERF_LOGS
+  const int64_t total_us = decode_us + preprocess_us + inference_us;
+  const int32_t delta_internal_free =
+      static_cast<int32_t>(after.free_internal) -
+      static_cast<int32_t>(before.free_internal);
+  const int32_t delta_spiram_free = static_cast<int32_t>(after.free_spiram) -
+                                    static_cast<int32_t>(before.free_spiram);
+  const int32_t delta_8bit_free = static_cast<int32_t>(after.free_8bit) -
+                                  static_cast<int32_t>(before.free_8bit);
+
+  ESP_LOGI(kTag,
+           "Perf path=%s in=%dx%d bytes=%u ms{decode=%.2f pre=%.2f infer=%.2f "
+           "total=%.2f}",
+           path_name, input_width, input_height,
+           static_cast<unsigned>(input_bytes),
+           static_cast<double>(decode_us) / 1000.0,
+           static_cast<double>(preprocess_us) / 1000.0,
+           static_cast<double>(inference_us) / 1000.0,
+           static_cast<double>(total_us) / 1000.0);
+
+  ESP_LOGI(kTag,
+           "Mem path=%s int{free=%u largest=%u min=%u d=%ld} psram{free=%u "
+           "largest=%u min=%u d=%ld} 8bit{free=%u largest=%u min=%u d=%ld} "
+           "stack_hwm_words=%u jpeg_buf{decode=%u gray=%u}",
+           path_name, static_cast<unsigned>(after.free_internal),
+           static_cast<unsigned>(after.largest_internal),
+           static_cast<unsigned>(after.minimum_internal),
+           static_cast<long>(delta_internal_free),
+           static_cast<unsigned>(after.free_spiram),
+           static_cast<unsigned>(after.largest_spiram),
+           static_cast<unsigned>(after.minimum_spiram),
+           static_cast<long>(delta_spiram_free),
+           static_cast<unsigned>(after.free_8bit),
+           static_cast<unsigned>(after.largest_8bit),
+           static_cast<unsigned>(after.minimum_8bit),
+           static_cast<long>(delta_8bit_free),
+           static_cast<unsigned>(after.stack_hwm_words),
+           static_cast<unsigned>(s_jpeg_decode_buffer_size),
+           static_cast<unsigned>(s_jpeg_crop_buffer_size));
+#else
+  (void)path_name;
+  (void)input_bytes;
+  (void)input_width;
+  (void)input_height;
+  (void)decode_us;
+  (void)preprocess_us;
+  (void)inference_us;
+  (void)before;
+  (void)after;
+#endif
+}
 
 bool add_resolver_op(TfLiteStatus status, const char* name) {
   if (status == kTfLiteOk) {
@@ -385,6 +484,41 @@ esp_err_t read_output_probabilities(float probs[DIGIT_INFERENCE_NUM_CLASSES]) {
   return ESP_OK;
 }
 
+esp_err_t run_inference_core(
+    const uint8_t input_28x28[DIGIT_INFERENCE_INPUT_SIZE],
+    digit_inference_result_t* result) {
+  esp_err_t err = quantize_or_copy_input(input_28x28);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  if (s_interpreter->Invoke() != kTfLiteOk) {
+    ESP_LOGE(kTag, "TFLM invoke failed");
+    return ESP_FAIL;
+  }
+
+  float probs[DIGIT_INFERENCE_NUM_CLASSES];
+  err = read_output_probabilities(probs);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  int best_digit = 0;
+  float best_score = probs[0];
+  for (int i = 1; i < DIGIT_INFERENCE_NUM_CLASSES; ++i) {
+    if (probs[i] > best_score) {
+      best_score = probs[i];
+      best_digit = i;
+    }
+  }
+
+  result->predicted_digit = best_digit;
+  result->confidence = best_score;
+  memcpy(result->probabilities, probs, sizeof(probs));
+
+  return ESP_OK;
+}
+
 }  // namespace
 
 extern "C" esp_err_t digit_inference_init(void) {
@@ -476,34 +610,21 @@ extern "C" esp_err_t digit_inference_run_u8(
     return err;
   }
 
-  err = quantize_or_copy_input(input_28x28);
+  perf_snapshot_t before = {};
+  perf_snapshot_t after = {};
+  capture_perf_snapshot(&before);
+
+  const int64_t t_infer_begin = esp_timer_get_time();
+  err = run_inference_core(input_28x28, result);
+  const int64_t t_infer_end = esp_timer_get_time();
   if (err != ESP_OK) {
     return err;
   }
 
-  if (s_interpreter->Invoke() != kTfLiteOk) {
-    ESP_LOGE(kTag, "TFLM invoke failed");
-    return ESP_FAIL;
-  }
-
-  float probs[DIGIT_INFERENCE_NUM_CLASSES];
-  err = read_output_probabilities(probs);
-  if (err != ESP_OK) {
-    return err;
-  }
-
-  int best_digit = 0;
-  float best_score = probs[0];
-  for (int i = 1; i < DIGIT_INFERENCE_NUM_CLASSES; ++i) {
-    if (probs[i] > best_score) {
-      best_score = probs[i];
-      best_digit = i;
-    }
-  }
-
-  result->predicted_digit = best_digit;
-  result->confidence = best_score;
-  memcpy(result->probabilities, probs, sizeof(probs));
+  capture_perf_snapshot(&after);
+  log_pipeline_perf("u8", DIGIT_INFERENCE_INPUT_SIZE,
+                    DIGIT_INFERENCE_INPUT_SIDE, DIGIT_INFERENCE_INPUT_SIDE, 0,
+                    0, t_infer_end - t_infer_begin, before, after);
 
   return ESP_OK;
 }
@@ -516,13 +637,36 @@ extern "C" esp_err_t digit_inference_run_from_gray_u8(
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t err =
-      digit_preprocess_u8(input_gray, width, height, params, output_28x28);
+  esp_err_t err = digit_inference_init();
   if (err != ESP_OK) {
     return err;
   }
 
-  return digit_inference_run_u8(output_28x28, result);
+  perf_snapshot_t before = {};
+  perf_snapshot_t after = {};
+  capture_perf_snapshot(&before);
+
+  const int64_t t_pre_begin = esp_timer_get_time();
+  err = digit_preprocess_u8(input_gray, width, height, params, output_28x28);
+  const int64_t t_pre_end = esp_timer_get_time();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  const int64_t t_infer_begin = esp_timer_get_time();
+  err = run_inference_core(output_28x28, result);
+  const int64_t t_infer_end = esp_timer_get_time();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  capture_perf_snapshot(&after);
+  log_pipeline_perf("gray",
+                    static_cast<size_t>(width) * static_cast<size_t>(height),
+                    width, height, 0, t_pre_end - t_pre_begin,
+                    t_infer_end - t_infer_begin, before, after);
+
+  return ESP_OK;
 }
 
 extern "C" esp_err_t digit_inference_run_from_jpeg_u8(
@@ -534,15 +678,44 @@ extern "C" esp_err_t digit_inference_run_from_jpeg_u8(
     return ESP_ERR_INVALID_ARG;
   }
 
-  const uint8_t* gray = nullptr;
-  int width = 0;
-  int height = 0;
-  esp_err_t err =
-      decode_jpeg_to_gray(input_jpeg, jpeg_size, &gray, &width, &height);
+  esp_err_t err = digit_inference_init();
   if (err != ESP_OK) {
     return err;
   }
 
-  return digit_inference_run_from_gray_u8(gray, width, height, params, result,
-                                          output_28x28);
+  perf_snapshot_t before = {};
+  perf_snapshot_t after = {};
+  capture_perf_snapshot(&before);
+
+  const int64_t t_decode_begin = esp_timer_get_time();
+
+  const uint8_t* gray = nullptr;
+  int width = 0;
+  int height = 0;
+  err = decode_jpeg_to_gray(input_jpeg, jpeg_size, &gray, &width, &height);
+  const int64_t t_decode_end = esp_timer_get_time();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  const int64_t t_pre_begin = esp_timer_get_time();
+  err = digit_preprocess_u8(gray, width, height, params, output_28x28);
+  const int64_t t_pre_end = esp_timer_get_time();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  const int64_t t_infer_begin = esp_timer_get_time();
+  err = run_inference_core(output_28x28, result);
+  const int64_t t_infer_end = esp_timer_get_time();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  capture_perf_snapshot(&after);
+  log_pipeline_perf("jpeg", jpeg_size, width, height,
+                    t_decode_end - t_decode_begin, t_pre_end - t_pre_begin,
+                    t_infer_end - t_infer_begin, before, after);
+
+  return ESP_OK;
 }
