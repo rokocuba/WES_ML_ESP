@@ -1,9 +1,7 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
-  ],
-  "idf.portWin": "detect",
+  "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
+  "idf.portWin": "COM9",
   "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -13,5 +11,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\38591\\WES_ML_ESP\\build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }

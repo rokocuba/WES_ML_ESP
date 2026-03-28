@@ -19,7 +19,7 @@
 namespace {
 
 constexpr const char *kTag = "digit_inference";
-constexpr int kResolverOps = 12;
+constexpr int kResolverOps = 16;
 
 const tflite::Model *s_model = nullptr;
 tflite::MicroInterpreter *s_interpreter = nullptr;
@@ -62,6 +62,15 @@ bool setup_resolver_once()
         return false;
     }
     if (!add_resolver_op(s_resolver.AddReshape(), "Reshape")) {
+        return false;
+    }
+    if (!add_resolver_op(s_resolver.AddShape(), "Shape")) {
+        return false;
+    }
+    if (!add_resolver_op(s_resolver.AddStridedSlice(), "StridedSlice")) {
+        return false;
+    }
+    if (!add_resolver_op(s_resolver.AddPack(), "Pack")) {
         return false;
     }
     if (!add_resolver_op(s_resolver.AddSoftmax(), "Softmax")) {
@@ -265,7 +274,12 @@ extern "C" esp_err_t digit_inference_init(void)
 
     if (s_interpreter->AllocateTensors() != kTfLiteOk) {
         ESP_LOGE(kTag, "AllocateTensors failed, try increasing DIGIT_INFERENCE_TENSOR_ARENA_SIZE");
-        digit_inference_deinit();
+        // Avoid calling MicroInterpreter destructor after a failed allocation.
+        // Some TFLM versions may leave partially initialized graph state.
+        s_interpreter = nullptr;
+        s_input = nullptr;
+        s_output = nullptr;
+        free_tensor_arena();
         return ESP_ERR_NO_MEM;
     }
 
