@@ -54,7 +54,7 @@ def emit_header(path: Path) -> None:
         "#include <stddef.h>\n"
         "#include <stdint.h>\n\n"
         "#ifdef __cplusplus\n"
-        "extern \"C\" {\n"
+        'extern "C" {\n'
         "#endif\n\n"
         "typedef struct {\n"
         "    const char *name;\n"
@@ -107,11 +107,11 @@ def emit_source(path: Path, header_name: str, images: list[ImageRecord]) -> None
     for image in images:
         lines.append(
             "    {"
-            f' \"{image.name}\", '
-            f'{image.width}, '
-            f'{image.height}, '
-            f'{image.symbol}, '
-            f'sizeof({image.symbol}) '
+            f' "{image.name}", '
+            f"{image.width}, "
+            f"{image.height}, "
+            f"{image.symbol}, "
+            f"sizeof({image.symbol}) "
             "},"
         )
     lines.append("};")

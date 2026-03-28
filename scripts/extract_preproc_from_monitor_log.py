@@ -8,7 +8,9 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-BEGIN_RE = re.compile(r"Preproc28 BEGIN name=(?P<name>[^ ]+) w=(?P<w>\d+) h=(?P<h>\d+) format=hex")
+BEGIN_RE = re.compile(
+    r"Preproc28 BEGIN name=(?P<name>[^ ]+) w=(?P<w>\d+) h=(?P<h>\d+) format=hex"
+)
 ROW_RE = re.compile(r"Preproc28 ROW(?P<row>\d{2}) (?P<hex>[0-9a-fA-F]+)")
 END_RE = re.compile(r"Preproc28 END name=(?P<name>[^ ]+)")
 
@@ -17,8 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Parse monitor logs and export Preproc28 frames as .pgm files."
     )
-    parser.add_argument("--log", type=Path, required=True, help="Path to saved monitor log text file")
-    parser.add_argument("--out-dir", type=Path, default=Path("preproc_frames"), help="Output directory")
+    parser.add_argument(
+        "--log", type=Path, required=True, help="Path to saved monitor log text file"
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("preproc_frames"), help="Output directory"
+    )
     return parser.parse_args()
 
 
@@ -93,7 +99,9 @@ def main() -> None:
             if end_match and current_name is not None:
                 end_name = end_match.group("name")
                 if end_name != current_name:
-                    raise ValueError(f"Mismatched frame end: {end_name} != {current_name}")
+                    raise ValueError(
+                        f"Mismatched frame end: {end_name} != {current_name}"
+                    )
                 out_path = finalize_frame(
                     args.out_dir,
                     counters,
