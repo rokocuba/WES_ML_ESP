@@ -1,6 +1,7 @@
 #include "./digit_inference.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -357,6 +358,20 @@ bool allocate_tensor_arena(size_t arena_size) {
   return false;
 }
 
+uint32_t fnv1a32(const uint8_t* data, size_t len) {
+  if (data == nullptr || len == 0) {
+    return 0;
+  }
+
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; ++i) {
+    hash ^= data[i];
+    hash *= 16777619u;
+  }
+
+  return hash;
+}
+
 esp_err_t quantize_or_copy_input(
     const uint8_t input_28x28[DIGIT_INFERENCE_INPUT_SIZE]) {
   if (s_input == nullptr) {
@@ -490,6 +505,27 @@ esp_err_t run_inference_core(
 extern "C" esp_err_t digit_inference_init(void) {
   if (s_interpreter != nullptr) {
     return ESP_OK;
+  }
+
+  if (g_mnist_tiny_int8_model_len == 0) {
+    ESP_LOGE(kTag, "Model buffer is empty");
+    return ESP_FAIL;
+  }
+
+  const uint32_t model_hash =
+      fnv1a32(g_mnist_tiny_int8_model, g_mnist_tiny_int8_model_len);
+  if (g_mnist_tiny_int8_model_len >= 4) {
+    ESP_LOGI(kTag,
+             "Model fingerprint len=%u fnv1a32=0x%08" PRIx32
+             " head=%02x%02x%02x%02x",
+             static_cast<unsigned>(g_mnist_tiny_int8_model_len), model_hash,
+             static_cast<unsigned>(g_mnist_tiny_int8_model[0]),
+             static_cast<unsigned>(g_mnist_tiny_int8_model[1]),
+             static_cast<unsigned>(g_mnist_tiny_int8_model[2]),
+             static_cast<unsigned>(g_mnist_tiny_int8_model[3]));
+  } else {
+    ESP_LOGI(kTag, "Model fingerprint len=%u fnv1a32=0x%08" PRIx32,
+             static_cast<unsigned>(g_mnist_tiny_int8_model_len), model_hash);
   }
 
   s_model = tflite::GetModel(g_mnist_tiny_int8_model);
