@@ -1,189 +1,303 @@
-#include <ctype.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
+
+#include "driver/uart.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "digit_inference.h"
-#include "digit_test_images_data.h"
 
 static const char *TAG = "main";
 
-static bool ends_with_ignore_case(const char *str, const char *suffix)
+/* UART protocol on USB serial (UART0):
+ *  Host -> Device:
+ *    INFER_JPEG\n
+ *    <jpeg_size_bytes>\n
+ *    <jpeg binary payload>
+ *  Device -> Host:
+ *    RESULT <digit> <confidence>\n
+ *    ERR <reason>\n
+ */
+#define UART_PORT            UART_NUM_0
+#define UART_BAUD_RATE       115200
+#define UART_RX_BUF_SIZE     1024
+#define UART_TX_BUF_SIZE     1024
+#define UART_READ_TIMEOUT_MS 100
+
+#define MAX_IMAGE_BYTES    (64 * 1024)
+#define IMAGE_RX_TIMEOUT_MS 4000
+
+static const char *REQUEST_COMMAND = "INFER_JPEG";
+#define CMD_LINE_MAX 64
+
+static bool uart_write_all(const void *data, size_t len)
 {
-	if (str == NULL || suffix == NULL) {
-		return false;
-	}
+    const uint8_t *ptr = (const uint8_t *)data;
+    size_t sent = 0;
 
-	const size_t str_len = strlen(str);
-	const size_t suffix_len = strlen(suffix);
-	if (suffix_len > str_len) {
-		return false;
-	}
+    while (sent < len) {
+        const int written = uart_write_bytes(UART_PORT, (const char *)(ptr + sent), len - sent);
+        if (written <= 0) {
+            return false;
+        }
+        sent += (size_t)written;
+    }
 
-	const char *start = str + (str_len - suffix_len);
-	for (size_t i = 0; i < suffix_len; ++i) {
-		const int a = tolower((unsigned char)start[i]);
-		const int b = tolower((unsigned char)suffix[i]);
-		if (a != b) {
-			return false;
-		}
-	}
-
-	return true;
+    return true;
 }
 
-static bool is_jpeg_name(const char *name)
+static bool uart_write_line(const char *line)
 {
-	return ends_with_ignore_case(name, ".jpg") || ends_with_ignore_case(name, ".jpeg");
+    if (!line) {
+        return false;
+    }
+    return uart_write_all(line, strlen(line));
 }
 
-static void log_top3(const digit_inference_result_t *result)
+static bool init_uart(void)
 {
-	int best = -1;
-	int second = -1;
-	int third = -1;
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+#if ESP_IDF_VERSION_MAJOR >= 5
+        .source_clk = UART_SCLK_DEFAULT,
+#endif
+    };
 
-	for (int i = 0; i < DIGIT_INFERENCE_NUM_CLASSES; ++i) {
-		if (best < 0 || result->probabilities[i] > result->probabilities[best]) {
-			third = second;
-			second = best;
-			best = i;
-		} else if (second < 0 || result->probabilities[i] > result->probabilities[second]) {
-			third = second;
-			second = i;
-		} else if (third < 0 || result->probabilities[i] > result->probabilities[third]) {
-			third = i;
-		}
-	}
+    if (!uart_is_driver_installed(UART_PORT)) {
+        esp_err_t install_err = uart_driver_install(UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
+        if (install_err != ESP_OK) {
+            ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(install_err));
+            return false;
+        }
+    }
 
-	if (best >= 0 && second >= 0 && third >= 0) {
-		ESP_LOGI(
-			TAG,
-			"Top3 => %d:%.3f, %d:%.3f, %d:%.3f",
-			best, result->probabilities[best],
-			second, result->probabilities[second],
-			third, result->probabilities[third]
-		);
-	}
+    esp_err_t err = uart_param_config(UART_PORT, &uart_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
 }
 
-static void log_preprocessed_frame_hex(const char *name, const uint8_t frame[DIGIT_INFERENCE_INPUT_SIZE])
+static bool is_infer_command(const char *line)
 {
-	char row_hex[(DIGIT_INFERENCE_INPUT_SIDE * 2) + 1];
-
-	ESP_LOGI(
-		TAG,
-		"Preproc28 BEGIN name=%s w=%d h=%d format=hex",
-		name,
-		DIGIT_INFERENCE_INPUT_SIDE,
-		DIGIT_INFERENCE_INPUT_SIDE
-	);
-
-	for (int y = 0; y < DIGIT_INFERENCE_INPUT_SIDE; ++y) {
-		for (int x = 0; x < DIGIT_INFERENCE_INPUT_SIDE; ++x) {
-			const uint8_t px = frame[y * DIGIT_INFERENCE_INPUT_SIDE + x];
-			(void)snprintf(&row_hex[x * 2], 3, "%02x", px);
-		}
-		row_hex[DIGIT_INFERENCE_INPUT_SIDE * 2] = '\0';
-		ESP_LOGI(TAG, "Preproc28 ROW%02d %s", y, row_hex);
-	}
-
-	ESP_LOGI(TAG, "Preproc28 END name=%s", name);
+    return (strcmp(line, REQUEST_COMMAND) == 0) ||
+           (strcmp(line, "RUN_INFER") == 0) ||
+           (strcmp(line, "SEND_PIC") == 0);
 }
 
-static void run_embedded_image_once(size_t image_index, bool dump_preprocessed)
+static bool parse_size_line(const char *line, size_t *out_size)
 {
-	const digit_preprocess_params_t *params = digit_preprocess_default_params();
-	uint8_t preprocessed[DIGIT_INFERENCE_INPUT_SIZE] = {0};
-	digit_inference_result_t result = {0};
-	const digit_test_image_t *image = &g_digit_test_images[image_index];
+    if (!line || !out_size || line[0] == '\0') {
+        return false;
+    }
 
-	memset(&result, 0, sizeof(result));
+    char *end = NULL;
+    unsigned long parsed = strtoul(line, &end, 10);
+    if (end == line || *end != '\0') {
+        return false;
+    }
+    if (parsed == 0 || parsed > MAX_IMAGE_BYTES) {
+        return false;
+    }
 
-	esp_err_t ret;
-	if (is_jpeg_name(image->name)) {
-		ret = digit_inference_run_from_jpeg_u8(
-			image->data,
-			image->data_len,
-			params,
-			&result,
-			preprocessed
-		);
-	} else if (image->data_len == (size_t)image->width * (size_t)image->height) {
-		/* Backward-compatible path for previously generated raw grayscale assets. */
-		ret = digit_inference_run_from_gray_u8(
-			image->data,
-			image->width,
-			image->height,
-			params,
-			&result,
-			preprocessed
-		);
-	} else {
-		ESP_LOGE(
-			TAG,
-			"EmbeddedImage[%u]=%s unsupported format for runtime path (bytes=%u)",
-			(unsigned)image_index,
-			image->name,
-			(unsigned)image->data_len
-		);
-		return;
-	}
-	if (ret != ESP_OK) {
-		ESP_LOGE(TAG, "EmbeddedImage[%u]=%s inference failed: %s", (unsigned)image_index, image->name, esp_err_to_name(ret));
-		return;
-	}
-
-	ESP_LOGI(
-		TAG,
-		"EmbeddedImage[%u]=%s (%dx%d) -> pred=%d conf=%.3f",
-		(unsigned)image_index,
-		image->name,
-		image->width,
-		image->height,
-		result.predicted_digit,
-		result.confidence
-	);
-	log_top3(&result);
-
-	if (dump_preprocessed) {
-		log_preprocessed_frame_hex(image->name, preprocessed);
-	}
+    *out_size = (size_t)parsed;
+    return true;
 }
 
-static void image_loop_task(void *arg)
+static void run_jpeg_inference_and_respond(const uint8_t *jpeg_buf, size_t jpeg_len)
 {
-	uint32_t cycle = 0;
-	(void)arg;
+    const digit_preprocess_params_t *params = digit_preprocess_default_params();
+    uint8_t preprocessed[DIGIT_INFERENCE_INPUT_SIZE] = {0};
+    digit_inference_result_t result = {0};
 
-	while (1) {
-		ESP_LOGI(TAG, "Image loop cycle=%lu count=%u", (unsigned long)cycle, (unsigned)g_digit_test_images_count);
+    const esp_err_t ret = digit_inference_run_from_jpeg_u8(
+        jpeg_buf,
+        jpeg_len,
+        params,
+        &result,
+        preprocessed
+    );
+    if (ret != ESP_OK) {
+        char err_line[64];
+        const int err_len = snprintf(err_line, sizeof(err_line), "ERR INFER %s\n", esp_err_to_name(ret));
+        if (err_len > 0) {
+            (void)uart_write_all(err_line, (size_t)err_len);
+        }
+        uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(1000));
+        return;
+    }
 
-		for (size_t i = 0; i < g_digit_test_images_count; ++i) {
-			const bool dump_preprocessed = (cycle == 0);
-			run_embedded_image_once(i, dump_preprocessed);
-		}
+    char response[64];
+    const int response_len = snprintf(
+        response,
+        sizeof(response),
+        "RESULT %d %.3f\n",
+        result.predicted_digit,
+        result.confidence
+    );
+    if (response_len > 0) {
+        (void)uart_write_all(response, (size_t)response_len);
+    }
+    uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(1000));
+}
 
-		++cycle;
-		vTaskDelay(pdMS_TO_TICKS(2000));
-	}
+static void uart_inference_task(void *arg)
+{
+    (void)arg;
+
+    uint8_t *rx_data = (uint8_t *)malloc(UART_RX_BUF_SIZE);
+    if (!rx_data) {
+        ESP_LOGE(TAG, "Failed to allocate UART RX buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    typedef enum {
+        RX_WAIT_COMMAND = 0,
+        RX_WAIT_SIZE,
+        RX_WAIT_PAYLOAD,
+    } rx_state_t;
+
+    rx_state_t state = RX_WAIT_COMMAND;
+    char line_buf[CMD_LINE_MAX];
+    int line_len = 0;
+    uint8_t *image_buf = NULL;
+    size_t image_size = 0;
+    size_t image_received = 0;
+    uint32_t no_data_ms = 0;
+
+    while (1) {
+        const int rx_bytes = uart_read_bytes(UART_PORT, rx_data, UART_RX_BUF_SIZE, pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
+        if (rx_bytes <= 0) {
+            if (state == RX_WAIT_PAYLOAD) {
+                no_data_ms += UART_READ_TIMEOUT_MS;
+                if (no_data_ms >= IMAGE_RX_TIMEOUT_MS) {
+                    (void)uart_write_line("ERR TIMEOUT\n");
+                    uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(1000));
+                    free(image_buf);
+                    image_buf = NULL;
+                    image_size = 0;
+                    image_received = 0;
+                    line_len = 0;
+                    state = RX_WAIT_COMMAND;
+                    uart_flush_input(UART_PORT);
+                }
+            }
+            continue;
+        }
+        no_data_ms = 0;
+
+        int offset = 0;
+        while (offset < rx_bytes) {
+            if (state == RX_WAIT_PAYLOAD) {
+                const size_t remaining = image_size - image_received;
+                const size_t available = (size_t)(rx_bytes - offset);
+                const size_t copy_len = (available < remaining) ? available : remaining;
+
+                memcpy(image_buf + image_received, rx_data + offset, copy_len);
+                image_received += copy_len;
+                offset += (int)copy_len;
+
+                if (image_received == image_size) {
+                    run_jpeg_inference_and_respond(image_buf, image_size);
+                    free(image_buf);
+                    image_buf = NULL;
+                    image_size = 0;
+                    image_received = 0;
+                    line_len = 0;
+                    state = RX_WAIT_COMMAND;
+                }
+                continue;
+            }
+
+            const char ch = (char)rx_data[offset++];
+
+            if (ch == '\r') {
+                continue;
+            }
+
+            if (ch == '\n') {
+                line_buf[line_len] = '\0';
+
+                if (state == RX_WAIT_COMMAND) {
+                    if (is_infer_command(line_buf)) {
+                        state = RX_WAIT_SIZE;
+                        (void)uart_write_line("READY_SIZE\n");
+                    } else if (line_buf[0] != '\0') {
+                        (void)uart_write_line("ERR CMD\n");
+                    }
+                } else if (state == RX_WAIT_SIZE) {
+                    size_t parsed_size = 0;
+                    if (!parse_size_line(line_buf, &parsed_size)) {
+                        (void)uart_write_line("ERR SIZE\n");
+                        state = RX_WAIT_COMMAND;
+                    } else {
+                        image_buf = (uint8_t *)malloc(parsed_size);
+                        if (!image_buf) {
+                            (void)uart_write_line("ERR OOM\n");
+                            state = RX_WAIT_COMMAND;
+                        } else {
+                            image_size = parsed_size;
+                            image_received = 0;
+                            state = RX_WAIT_PAYLOAD;
+                            (void)uart_write_line("READY_DATA\n");
+                        }
+                    }
+                }
+                line_len = 0;
+                continue;
+            }
+
+            if (line_len < (CMD_LINE_MAX - 1)) {
+                line_buf[line_len++] = ch;
+            } else {
+                line_len = 0;
+                (void)uart_write_line("ERR LINE\n");
+                state = RX_WAIT_COMMAND;
+                free(image_buf);
+                image_buf = NULL;
+                image_size = 0;
+                image_received = 0;
+            }
+        }
+
+        uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(100));
+    }
+
+    free(image_buf);
+    free(rx_data);
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-	ESP_LOGI(TAG, "Booted. Starting embedded image inference loop.");
+    ESP_LOGI(TAG, "Booted. Waiting for UART image inference requests.");
 
-	esp_err_t ret = digit_inference_init();
-	if (ret != ESP_OK) {
-		ESP_LOGE(TAG, "digit_inference_init failed: %s", esp_err_to_name(ret));
-		return;
-	}
+    if (!init_uart()) {
+        ESP_LOGE(TAG, "UART init failed");
+        return;
+    }
 
-	xTaskCreate(image_loop_task, "image_loop_task", 6144, NULL, 5, NULL);
+    esp_err_t ret = digit_inference_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "digit_inference_init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* Prevent ESP logs from corrupting serial protocol payload/response parsing. */
+    esp_log_level_set("*", ESP_LOG_NONE);
+
+    xTaskCreate(uart_inference_task, "uart_inference_task", 6144, NULL, 5, NULL);
 }
