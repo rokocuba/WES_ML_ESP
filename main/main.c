@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -12,6 +13,35 @@
 #include "digit_test_images_data.h"
 
 static const char *TAG = "main";
+
+static bool ends_with_ignore_case(const char *str, const char *suffix)
+{
+	if (str == NULL || suffix == NULL) {
+		return false;
+	}
+
+	const size_t str_len = strlen(str);
+	const size_t suffix_len = strlen(suffix);
+	if (suffix_len > str_len) {
+		return false;
+	}
+
+	const char *start = str + (str_len - suffix_len);
+	for (size_t i = 0; i < suffix_len; ++i) {
+		const int a = tolower((unsigned char)start[i]);
+		const int b = tolower((unsigned char)suffix[i]);
+		if (a != b) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static bool is_jpeg_name(const char *name)
+{
+	return ends_with_ignore_case(name, ".jpg") || ends_with_ignore_case(name, ".jpeg");
+}
 
 static void log_top3(const digit_inference_result_t *result)
 {
@@ -67,7 +97,7 @@ static void log_preprocessed_frame_hex(const char *name, const uint8_t frame[DIG
 	ESP_LOGI(TAG, "Preproc28 END name=%s", name);
 }
 
-static void run_embedded_png_once(size_t image_index, bool dump_preprocessed)
+static void run_embedded_image_once(size_t image_index, bool dump_preprocessed)
 {
 	const digit_preprocess_params_t *params = digit_preprocess_default_params();
 	uint8_t preprocessed[DIGIT_INFERENCE_INPUT_SIZE] = {0};
@@ -76,22 +106,43 @@ static void run_embedded_png_once(size_t image_index, bool dump_preprocessed)
 
 	memset(&result, 0, sizeof(result));
 
-	esp_err_t ret = digit_inference_run_from_gray_u8(
-		image->data,
-		image->width,
-		image->height,
-		params,
-		&result,
-		preprocessed
-	);
+	esp_err_t ret;
+	if (is_jpeg_name(image->name)) {
+		ret = digit_inference_run_from_jpeg_u8(
+			image->data,
+			image->data_len,
+			params,
+			&result,
+			preprocessed
+		);
+	} else if (image->data_len == (size_t)image->width * (size_t)image->height) {
+		/* Backward-compatible path for previously generated raw grayscale assets. */
+		ret = digit_inference_run_from_gray_u8(
+			image->data,
+			image->width,
+			image->height,
+			params,
+			&result,
+			preprocessed
+		);
+	} else {
+		ESP_LOGE(
+			TAG,
+			"EmbeddedImage[%u]=%s unsupported format for runtime path (bytes=%u)",
+			(unsigned)image_index,
+			image->name,
+			(unsigned)image->data_len
+		);
+		return;
+	}
 	if (ret != ESP_OK) {
-		ESP_LOGE(TAG, "EmbeddedPNG[%u]=%s inference failed: %s", (unsigned)image_index, image->name, esp_err_to_name(ret));
+		ESP_LOGE(TAG, "EmbeddedImage[%u]=%s inference failed: %s", (unsigned)image_index, image->name, esp_err_to_name(ret));
 		return;
 	}
 
 	ESP_LOGI(
 		TAG,
-		"EmbeddedPNG[%u]=%s (%dx%d) -> pred=%d conf=%.3f",
+		"EmbeddedImage[%u]=%s (%dx%d) -> pred=%d conf=%.3f",
 		(unsigned)image_index,
 		image->name,
 		image->width,
@@ -106,17 +157,17 @@ static void run_embedded_png_once(size_t image_index, bool dump_preprocessed)
 	}
 }
 
-static void png_loop_task(void *arg)
+static void image_loop_task(void *arg)
 {
 	uint32_t cycle = 0;
 	(void)arg;
 
 	while (1) {
-		ESP_LOGI(TAG, "PNG loop cycle=%lu count=%u", (unsigned long)cycle, (unsigned)g_digit_test_images_count);
+		ESP_LOGI(TAG, "Image loop cycle=%lu count=%u", (unsigned long)cycle, (unsigned)g_digit_test_images_count);
 
 		for (size_t i = 0; i < g_digit_test_images_count; ++i) {
 			const bool dump_preprocessed = (cycle == 0);
-			run_embedded_png_once(i, dump_preprocessed);
+			run_embedded_image_once(i, dump_preprocessed);
 		}
 
 		++cycle;
@@ -126,7 +177,7 @@ static void png_loop_task(void *arg)
 
 void app_main(void)
 {
-	ESP_LOGI(TAG, "Booted. Starting embedded PNG inference loop.");
+	ESP_LOGI(TAG, "Booted. Starting embedded image inference loop.");
 
 	esp_err_t ret = digit_inference_init();
 	if (ret != ESP_OK) {
@@ -134,5 +185,5 @@ void app_main(void)
 		return;
 	}
 
-	xTaskCreate(png_loop_task, "png_loop_task", 6144, NULL, 5, NULL);
+	xTaskCreate(image_loop_task, "image_loop_task", 6144, NULL, 5, NULL);
 }

@@ -41,8 +41,6 @@ size_t s_tensor_arena_size = 0;
 
 uint8_t* s_jpeg_decode_buffer = nullptr;
 size_t s_jpeg_decode_buffer_size = 0;
-uint8_t* s_jpeg_crop_buffer = nullptr;
-size_t s_jpeg_crop_buffer_size = 0;
 
 struct perf_snapshot_t {
   size_t free_8bit;
@@ -111,7 +109,7 @@ void log_pipeline_perf(const char* path_name, size_t input_bytes,
   ESP_LOGI(kTag,
            "Mem path=%s int{free=%u largest=%u min=%u d=%ld} psram{free=%u "
            "largest=%u min=%u d=%ld} 8bit{free=%u largest=%u min=%u d=%ld} "
-           "stack_hwm_words=%u jpeg_buf{decode=%u gray=%u}",
+           "stack_hwm_words=%u jpeg_buf{decode=%u extra_gray=%u}",
            path_name, static_cast<unsigned>(after.free_internal),
            static_cast<unsigned>(after.largest_internal),
            static_cast<unsigned>(after.minimum_internal),
@@ -126,7 +124,7 @@ void log_pipeline_perf(const char* path_name, size_t input_bytes,
            static_cast<long>(delta_8bit_free),
            static_cast<unsigned>(after.stack_hwm_words),
            static_cast<unsigned>(s_jpeg_decode_buffer_size),
-           static_cast<unsigned>(s_jpeg_crop_buffer_size));
+           static_cast<unsigned>(0));
 #else
   (void)path_name;
   (void)input_bytes;
@@ -211,12 +209,6 @@ void free_jpeg_buffers() {
     s_jpeg_decode_buffer = nullptr;
     s_jpeg_decode_buffer_size = 0;
   }
-
-  if (s_jpeg_crop_buffer != nullptr) {
-    heap_caps_free(s_jpeg_crop_buffer);
-    s_jpeg_crop_buffer = nullptr;
-    s_jpeg_crop_buffer_size = 0;
-  }
 }
 
 bool ensure_jpeg_decode_buffer(size_t needed_size) {
@@ -241,29 +233,6 @@ bool ensure_jpeg_decode_buffer(size_t needed_size) {
   }
 
   s_jpeg_decode_buffer_size = needed_size;
-  return true;
-}
-
-bool ensure_jpeg_crop_buffer(size_t needed_size) {
-  if (needed_size <= s_jpeg_crop_buffer_size && s_jpeg_crop_buffer != nullptr) {
-    return true;
-  }
-
-  if (s_jpeg_crop_buffer != nullptr) {
-    heap_caps_free(s_jpeg_crop_buffer);
-    s_jpeg_crop_buffer = nullptr;
-    s_jpeg_crop_buffer_size = 0;
-  }
-
-  s_jpeg_crop_buffer =
-      static_cast<uint8_t*>(heap_caps_malloc(needed_size, MALLOC_CAP_8BIT));
-  if (s_jpeg_crop_buffer == nullptr) {
-    ESP_LOGE(kTag, "Failed to allocate JPEG crop buffer (%u bytes)",
-             static_cast<unsigned>(needed_size));
-    return false;
-  }
-
-  s_jpeg_crop_buffer_size = needed_size;
   return true;
 }
 
@@ -327,11 +296,8 @@ esp_err_t decode_jpeg_to_gray(const uint8_t* input_jpeg, size_t jpeg_size,
     return ESP_ERR_INVALID_SIZE;
   }
 
-  const size_t cropped_size = pixel_count;
-  if (!ensure_jpeg_crop_buffer(cropped_size)) {
-    return ESP_ERR_NO_MEM;
-  }
-
+  // Convert in-place from RGB565(2B/px) to grayscale(1B/px) to avoid an
+  // additional full-frame allocation.
   for (size_t i = 0; i < pixel_count; ++i) {
     const uint16_t pixel565 =
         static_cast<uint16_t>(s_jpeg_decode_buffer[i * 2]) |
@@ -349,10 +315,10 @@ esp_err_t decode_jpeg_to_gray(const uint8_t* input_jpeg, size_t jpeg_size,
                               (29u * static_cast<uint32_t>(b8))) >>
                              8);
 
-    s_jpeg_crop_buffer[i] = gray;
+    s_jpeg_decode_buffer[i] = gray;
   }
 
-  *out_gray = s_jpeg_crop_buffer;
+  *out_gray = s_jpeg_decode_buffer;
   *out_w = static_cast<int>(outimg.width);
   *out_h = static_cast<int>(outimg.height);
   return ESP_OK;

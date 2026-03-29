@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert one or more image files into grayscale byte arrays for ESP-IDF builds."""
+"""Convert one or more image files into embedded encoded byte arrays for ESP-IDF builds."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class ImageRecord:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert image files into C source/header with grayscale byte arrays."
+        description="Convert image files into C source/header with encoded file byte arrays."
     )
     parser.add_argument(
         "--input",
@@ -126,9 +126,8 @@ def emit_source(path: Path, header_name: str, images: list[ImageRecord]) -> None
 
 def load_image(path: Path) -> tuple[int, int, bytes]:
     with Image.open(path) as image:
-        gray = image.convert("L")
-        width, height = gray.size
-        data = gray.tobytes()
+        width, height = image.size
+    data = path.read_bytes()
     return width, height, data
 
 
